@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>AI Travel Planner</title>
+	<link rel="stylesheet" href="../src/styles.css">
+</head>
+<body>
+	<header class="topbar">
+		<div class="brand">AI Travel Planner</div>
+		<nav class="actions">
+			<button id="btnSettings">设置</button>
+			<button id="btnAuth">登录</button>
+		</nav>
+	</header>
+
+	<main class="app">
+		<section class="map-wrap">
+			<div id="map" class="map"></div>
+			<div id="loadingMask" class="loading-mask" hidden>
+				<div class="loading-card">
+					<div class="spinner"></div>
+					<div>AI 正在规划行程…</div>
+				</div>
+			</div>
+		</section>
+		<section class="side">
+			<div class="input-card">
+				<textarea id="txtQuery" placeholder="例如：我想去上海，3天，预算3000，喜欢美食和博物馆，带孩子"></textarea>
+				<div class="row">
+					<button id="btnMic">🎤 语音</button>
+					<button id="btnPlan">生成行程</button>
+				</div>
+			</div>
+			<div class="itinerary" id="itinerary"></div>
+			<div class="budget" id="budget"></div>
+		</section>
+	</main>
+
+	<!-- 设置弹窗 -->
+	<div class="modal" id="modalSettings" hidden>
+		<div class="modal-body">
+			<h3>设置</h3>
+			<div class="grid">
+				<label>高德 Web Key<input id="amapKey" /></label>
+				<label>讯飞 AppId<input id="xfAppId" /></label>
+				<label>讯飞 API Key<input id="xfApiKey" /></label>
+				<label>讯飞 API Secret<input id="xfApiSecret" /></label>
+				<label>Supabase URL<input id="sbUrl" /></label>
+				<label>Supabase Anon Key<input id="sbAnon" /></label>
+				<label>LLM API Base（可选）<input id="llmBase" placeholder="如你的代理地址" /></label>
+				<label>LLM API Key（可选）<input id="llmKey" /></label>
+				<label>LLM 模型名（可选）<input id="llmModel" placeholder="如 deepseek-ai/DeepSeek-V2-Chat" /></label>
+			</div>
+			<div class="row end">
+				<button id="btnSaveSettings">保存</button>
+				<button id="btnCloseSettings">关闭</button>
+			</div>
+			<p class="muted">提示：未填讯飞将使用浏览器语音识别回退；未填 Supabase 将使用本地存储。</p>
+		</div>
+	</div>
+
+	<script type="module">
+		import { loadSettings, saveSettings, bindSettingsModal } from '../src/settings.js';
+		import { initMap, ensureAmapLoaded, renderPlanOnMap } from '../src/map.js';
+		import { startSpeechToText } from '../src/speech.js';
+		import { planFromText } from '../src/planner.js';
+		import { initAuth, getCurrentUser, signInWithEmailLink, signOut } from '../src/auth.js';
+		import { initStorage, savePlanForUser, listPlansForUser } from '../src/storage.js';
+		import { el, setHTML } from '../src/util.js';
+
+		// 绑定设置弹窗
+		bindSettingsModal();
+		const settings = loadSettings();
+
+		// 初始化地图（按需加载高德脚本）
+		await ensureAmapLoaded(settings.amapKey);
+		initMap();
+
+		// 初始化云端
+		await initAuth(settings);
+		await initStorage(settings);
+
+		// 登录按钮行为（简单切换：未登录->提示邮箱登录，已登录->退出）
+		el('btnAuth').addEventListener('click', async () => {
+			const user = getCurrentUser();
+			if (!user) {
+				const email = prompt('输入邮箱进行登录（Supabase Magic Link）:');
+				if (email) {
+					await signInWithEmailLink(email);
+					alert('登录邮件已发送，请按提示完成登录后刷新页面。');
+				}
+			} else {
+				await signOut();
+				alert('已退出登录');
+			}
+		});
+
+		// 语音按钮
+		el('btnMic').addEventListener('click', async () => {
+			el('btnMic').disabled = true;
+			try {
+				const text = await startSpeechToText(settings);
+				if (text) {
+					el('txtQuery').value = text;
+				}
+			} catch (e) {
+				alert('语音识别失败：' + e.message);
+			} finally {
+				el('btnMic').disabled = false;
+			}
+		});
+
+		// 生成行程
+		el('btnPlan').addEventListener('click', async () => {
+			const input = el('txtQuery').value.trim();
+			if (!input) return alert('请输入或通过语音输入旅行需求');
+			setLoading(true);
+			try {
+				el('btnPlan').disabled = true;
+				const plan = await planFromText(input, settings);
+				await renderPlanOnMap(plan);
+				renderItinerary(plan);
+				renderBudget(plan);
+				const user = getCurrentUser();
+				if (user) await savePlanForUser(user, plan);
+			} finally {
+				el('btnPlan').disabled = false;
+				setLoading(false);
+			}
+		});
+
+		function renderItinerary(plan) {
+			const lines = [];
+			lines.push(`<h3>行程安排</h3>`);
+			(plan.days || []).forEach((day, idx) => {
+				lines.push(`<div class="day"><div class="day-title">第 ${idx+1} 天 · ${day.city || plan.destination || ''}</div>`);
+				lines.push(`<ul>`);
+				(day.pois || []).forEach(p => {
+					lines.push(`<li>${p.name}${p.note ? ' · ' + p.note : ''}</li>`);
+				});
+				lines.push(`</ul></div>`);
+			});
+			setHTML('itinerary', lines.join(''));
+		}
+
+		function renderBudget(plan) {
+			const b = plan.budget || {};
+			const lines = [];
+			lines.push(`<h3>预算</h3>`);
+			lines.push(`<div class="kv"><span>总预算</span><b>${b.total ?? '—'}</b></div>`);
+			lines.push(`<div class="kv"><span>交通</span><b>${b.transport ?? '—'}</b></div>`);
+			lines.push(`<div class="kv"><span>住宿</span><b>${b.hotel ?? '—'}</b></div>`);
+			lines.push(`<div class="kv"><span>餐饮</span><b>${b.food ?? '—'}</b></div>`);
+			lines.push(`<div class="kv"><span>门票</span><b>${b.tickets ?? '—'}</b></div>`);
+			setHTML('budget', lines.join(''));
+		}
+
+		function setLoading(flag) {
+			const mask = el('loadingMask');
+			if (!mask) return;
+			mask.hidden = !flag;
+		}
+	</script>
+</body>
+</html>
+
+
